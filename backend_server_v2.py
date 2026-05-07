@@ -14,7 +14,6 @@ CORS(app)
 
 DB_FILE = "iot_data_v2.db"
 
-# GPIO setup
 TILT_GPIO = 17
 DHT_PIN = board.D4
 
@@ -34,6 +33,14 @@ latest_data = {
     "active_delivery_id": None
 }
 
+last_saved_state = {
+    "delivery_id": None,
+    "temperature": None,
+    "humidity": None,
+    "tilt": None,
+    "alerts": []
+}
+
 data_lock = threading.Lock()
 
 
@@ -43,20 +50,29 @@ def get_db_connection():
     return conn
 
 
+def ensure_request_id_column():
+    conn = get_db_connection()
+    cur = conn.cursor()
+
+    cur.execute("PRAGMA table_info(deliveries)")
+    columns = [col["name"] for col in cur.fetchall()]
+
+    if "request_id" not in columns:
+        cur.execute("ALTER TABLE deliveries ADD COLUMN request_id INTEGER")
+
+    conn.commit()
+    conn.close()
+
 def update_alerts():
     alerts = []
 
-    temperature = latest_data["temperature"]
-    humidity = latest_data["humidity"]
-    tilt = latest_data["tilt"]
-
-    if temperature is not None and temperature > 30:
+    if latest_data["temperature"] is not None and latest_data["temperature"] > 26:
         alerts.append("High temperature")
 
-    if humidity is not None and humidity > 75:
+    if latest_data["humidity"] is not None and latest_data["humidity"] > 60:
         alerts.append("High humidity")
 
-    if tilt:
+    if latest_data["tilt"]:
         alerts.append("Box tilted")
 
     latest_data["alerts"] = alerts
@@ -69,7 +85,7 @@ def get_current_active_delivery():
     cur.execute("""
         SELECT id
         FROM deliveries
-        WHERE status = 'active'
+        WHERE status = 'in_progress'
         ORDER BY id DESC
         LIMIT 1
     """)
@@ -77,16 +93,61 @@ def get_current_active_delivery():
     row = cur.fetchone()
     conn.close()
 
-    if row:
-        return row["id"]
-
-    return None
+    return row["id"] if row else None
 
 
 def save_monitoring_record():
+    global last_saved_state
+
     delivery_id = latest_data["active_delivery_id"]
 
     if delivery_id is None:
+        return
+
+    current_temp = latest_data["temperature"]
+    current_humidity = latest_data["humidity"]
+    current_tilt = latest_data["tilt"]
+
+    if current_temp is None or current_humidity is None:
+        return
+
+    event_alerts = []
+
+    new_delivery = last_saved_state["delivery_id"] != delivery_id
+
+    if new_delivery:
+        event_alerts.append("Monitoring started")
+
+    if last_saved_state["temperature"] is not None:
+        temp_diff = current_temp - last_saved_state["temperature"]
+
+        if abs(temp_diff) >= 1:
+            if temp_diff > 0:
+                event_alerts.append(f"Temperature increased by {temp_diff:.1f} C")
+            else:
+                event_alerts.append(f"Temperature decreased by {abs(temp_diff):.1f} C")
+
+    if last_saved_state["humidity"] is not None:
+        humidity_diff = current_humidity - last_saved_state["humidity"]
+
+        if abs(humidity_diff) >= 5:
+            if humidity_diff > 0:
+                event_alerts.append(f"Humidity increased by {humidity_diff:.1f}%")
+            else:
+                event_alerts.append(f"Humidity decreased by {abs(humidity_diff):.1f}%")
+
+    if last_saved_state["tilt"] is not None and current_tilt != last_saved_state["tilt"]:
+        if current_tilt:
+            event_alerts.append("Box tilted")
+        else:
+            event_alerts.append("Box returned to normal position")
+
+    if new_delivery and current_tilt:
+        event_alerts.append("Box tilted")
+
+    event_alerts = list(dict.fromkeys(event_alerts))
+
+    if not event_alerts:
         return
 
     conn = get_db_connection()
@@ -109,47 +170,24 @@ def save_monitoring_record():
         latest_data["sensor_time"],
         latest_data["lat"],
         latest_data["lon"],
-        latest_data["temperature"],
-        latest_data["humidity"],
-        1 if latest_data["tilt"] else 0,
-        json.dumps(latest_data["alerts"])
+        current_temp,
+        current_humidity,
+        1 if current_tilt else 0,
+        json.dumps(event_alerts)
     ))
 
     conn.commit()
     conn.close()
 
-def create_delivery_request_in_db(school_id, food_type, quantity, requested_delivery_time, special_notes):
-    conn = get_db_connection()
-    cur = conn.cursor()
+    last_saved_state = {
+        "delivery_id": delivery_id,
+        "temperature": current_temp,
+        "humidity": current_humidity,
+        "tilt": current_tilt,
+        "alerts": latest_data["alerts"].copy()
+    }
 
-    created_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-    cur.execute("""
-        INSERT INTO delivery_requests (
-            school_id,
-            food_type,
-            quantity,
-            requested_delivery_time,
-            special_notes,
-            status,
-            created_at
-        )
-        VALUES (?, ?, ?, ?, ?, 'requested', ?)
-    """, (
-        school_id,
-        food_type,
-        quantity,
-        requested_delivery_time,
-        special_notes,
-        created_at
-    ))
-
-    request_id = cur.lastrowid
-
-    conn.commit()
-    conn.close()
-
-    return request_id
+    print("Monitoring event saved:", event_alerts)
 
 
 def sensor_loop():
@@ -161,12 +199,8 @@ def sensor_loop():
             if monitoring_active:
                 now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-                # Real sensor reads
                 temperature = dht_device.temperature
                 humidity = dht_device.humidity
-
-                # If your tilt is reversed, change to:
-                # tilt = not bool(tilt_sensor.value)
                 tilt = bool(tilt_sensor.value)
 
                 active_delivery_id = get_current_active_delivery()
@@ -183,10 +217,10 @@ def sensor_loop():
 
                 print(
                     "Time:", now,
-                    "| Temp:", latest_data["temperature"],
-                    "| Hum:", latest_data["humidity"],
-                    "| Tilt:", latest_data["tilt"],
-                    "| Active delivery:", latest_data["active_delivery_id"]
+                    "| Temp:", temperature,
+                    "| Hum:", humidity,
+                    "| Tilt:", tilt,
+                    "| Active delivery:", active_delivery_id
                 )
             else:
                 print("Monitoring paused")
@@ -214,6 +248,7 @@ def location():
         latest_data["lon"] = lon
         latest_data["gps_time"] = now
 
+    print("GPS:", lat, lon)
     return "OK"
 
 
@@ -246,7 +281,6 @@ def stop_monitoring():
         "monitoring_active": latest_data["monitoring_active"]
     })
 
-
 @app.route("/active-delivery")
 def active_delivery():
     active_delivery_id = get_current_active_delivery()
@@ -256,56 +290,6 @@ def active_delivery():
 
     return jsonify({
         "active_delivery_id": active_delivery_id
-    })
-
-@app.route("/start-delivery/<int:delivery_id>", methods=["POST"])
-def start_delivery(delivery_id):
-    conn = get_db_connection()
-    cur = conn.cursor()
-
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-    cur.execute("""
-        UPDATE deliveries
-        SET status = 'active', start_time = ?
-        WHERE id = ?
-    """, (now, delivery_id))
-
-    conn.commit()
-    conn.close()
-
-    with data_lock:
-        latest_data["active_delivery_id"] = delivery_id
-
-    return jsonify({
-        "message": "Delivery started",
-        "delivery_id": delivery_id
-    })
-
-
-@app.route("/stop-delivery/<int:delivery_id>", methods=["POST"])
-def stop_delivery(delivery_id):
-    conn = get_db_connection()
-    cur = conn.cursor()
-
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-    cur.execute("""
-        UPDATE deliveries
-        SET status = 'completed', end_time = ?
-        WHERE id = ?
-    """, (now, delivery_id))
-
-    conn.commit()
-    conn.close()
-
-    with data_lock:
-        if latest_data["active_delivery_id"] == delivery_id:
-            latest_data["active_delivery_id"] = None
-
-    return jsonify({
-        "message": "Delivery completed",
-        "delivery_id": delivery_id
     })
 
 
@@ -323,28 +307,42 @@ def create_request():
     special_notes = data.get("special_notes", "")
 
     if not school_id or not food_type or not quantity or not requested_delivery_time:
-        return jsonify({
-            "error": "Missing required fields: school_id, food_type, quantity, requested_delivery_time"
-        }), 400
+        return jsonify({"error": "Missing required fields"}), 400
 
-    try:
-        request_id = create_delivery_request_in_db(
-            school_id=school_id,
-            food_type=food_type,
-            quantity=quantity,
-            requested_delivery_time=requested_delivery_time,
-            special_notes=special_notes
+    conn = get_db_connection()
+    cur = conn.cursor()
+
+    created_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    cur.execute("""
+        INSERT INTO delivery_requests (
+            school_id,
+            food_type,
+            quantity,
+            requested_delivery_time,
+            special_notes,
+            status,
+            created_at
         )
+        VALUES (?, ?, ?, ?, ?, 'requested', ?)
+    """, (
+        school_id,
+        food_type,
+        quantity,
+        requested_delivery_time,
+        special_notes,
+        created_at
+    ))
 
-        return jsonify({
-            "message": "Delivery request created successfully",
-            "request_id": request_id
-        }), 201
+    request_id = cur.lastrowid
 
-    except Exception as e:
-        return jsonify({
-            "error": str(e)
-        }), 500
+    conn.commit()
+    conn.close()
+
+    return jsonify({
+        "message": "Delivery request created successfully",
+        "request_id": request_id
+    }), 201
 
 
 @app.route("/requests")
@@ -353,9 +351,21 @@ def get_requests():
     cur = conn.cursor()
 
     cur.execute("""
-        SELECT id, school_id, food_type, quantity, requested_delivery_time, special_notes, status, created_at
-        FROM delivery_requests
-        ORDER BY id DESC
+        SELECT 
+            dr.id,
+            dr.school_id,
+            dr.food_type,
+            dr.quantity,
+            dr.requested_delivery_time,
+            dr.special_notes,
+            dr.status,
+            dr.created_at,
+            d.id AS delivery_id,
+            d.driver_id
+        FROM delivery_requests dr
+        LEFT JOIN deliveries d
+            ON d.request_id = dr.id
+        ORDER BY dr.id DESC
     """)
 
     rows = cur.fetchall()
@@ -372,7 +382,9 @@ def get_requests():
             "requested_delivery_time": row["requested_delivery_time"],
             "special_notes": row["special_notes"],
             "status": row["status"],
-            "created_at": row["created_at"]
+            "created_at": row["created_at"],
+            "delivery_id": row["delivery_id"],
+            "driver_id": row["driver_id"]
         })
 
     return jsonify(result)
@@ -385,48 +397,50 @@ def assign_request():
     driver_id = data.get("driver_id")
 
     if not request_id or not driver_id:
-        return jsonify({"error": "Missing request_id or driver_id"}), 400
+        return jsonify({"error": "request_id and driver_id are required"}), 400
 
     conn = get_db_connection()
     cur = conn.cursor()
 
     cur.execute("""
-        SELECT school_id, food_type, quantity, special_notes
+        SELECT *
         FROM delivery_requests
         WHERE id = ?
     """, (request_id,))
 
-    request_data = cur.fetchone()
+    delivery_request = cur.fetchone()
 
-    if not request_data:
+    if delivery_request is None:
         conn.close()
-        return jsonify({"error": "Request not found"}), 404
+        return jsonify({"error": "Delivery request not found"}), 404
 
-    school_id = request_data["school_id"]
-    food_type = request_data["food_type"]
-    quantity = request_data["quantity"]
-    notes = request_data["special_notes"]
+    if delivery_request["status"] != "requested":
+        conn.close()
+        return jsonify({"error": "Only requested deliveries can be assigned"}), 400
 
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     cur.execute("""
         INSERT INTO deliveries (
+            request_id,
             driver_id,
             school_id,
             food_type,
             quantity,
             status,
+            start_time,
+            end_time,
             notes,
             created_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, 'assigned', NULL, NULL, ?, ?)
     """, (
+        request_id,
         driver_id,
-        school_id,
-        food_type,
-        quantity,
-        "pending",
-        notes,
+        delivery_request["school_id"],
+        delivery_request["food_type"],
+        delivery_request["quantity"],
+        delivery_request["special_notes"],
         now
     ))
 
@@ -446,6 +460,170 @@ def assign_request():
         "delivery_id": delivery_id
     }), 201
 
+
+@app.route("/driver-deliveries/<int:driver_id>")
+def get_driver_deliveries(driver_id):
+    conn = get_db_connection()
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT id, request_id, driver_id, school_id, food_type, quantity,
+               status, start_time, end_time, notes, created_at
+        FROM deliveries
+        WHERE driver_id = ?
+        ORDER BY id DESC
+    """, (driver_id,))
+
+    rows = cur.fetchall()
+    conn.close()
+
+    result = []
+
+    for row in rows:
+        result.append({
+            "id": row["id"],
+            "request_id": row["request_id"],
+            "driver_id": row["driver_id"],
+            "school_id": row["school_id"],
+            "food_type": row["food_type"],
+            "quantity": row["quantity"],
+            "status": row["status"],
+            "start_time": row["start_time"],
+            "end_time": row["end_time"],
+            "notes": row["notes"],
+            "created_at": row["created_at"]
+        })
+
+    return jsonify(result)
+
+@app.route("/start-delivery", methods=["POST"])
+def start_delivery():
+    data = request.get_json()
+
+    if not data or "delivery_id" not in data:
+        return jsonify({"error": "Missing delivery_id"}), 400
+
+    delivery_id = data["delivery_id"]
+
+    conn = get_db_connection()
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT *
+        FROM deliveries
+        WHERE id = ?
+    """, (delivery_id,))
+
+    delivery = cur.fetchone()
+
+    if delivery is None:
+        conn.close()
+        return jsonify({"error": "Delivery not found"}), 404
+
+    if delivery["status"] != "assigned":
+        conn.close()
+        return jsonify({"error": "Only assigned deliveries can be started"}), 400
+
+    cur.execute("""
+        SELECT id
+        FROM deliveries
+        WHERE driver_id = ?
+        AND status = 'in_progress'
+        LIMIT 1
+    """, (delivery["driver_id"],))
+
+    active_driver_delivery = cur.fetchone()
+
+    if active_driver_delivery is not None:
+        conn.close()
+        return jsonify({
+            "error": "Impossible: another delivery is already in progress"
+        }), 400
+
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    cur.execute("""
+        UPDATE deliveries
+        SET status = 'in_progress',
+            start_time = ?
+        WHERE id = ?
+    """, (now, delivery_id))
+
+    if delivery["request_id"] is not None:
+        cur.execute("""
+            UPDATE delivery_requests
+            SET status = 'in_progress'
+            WHERE id = ?
+        """, (delivery["request_id"],))
+
+    conn.commit()
+    conn.close()
+
+    with data_lock:
+        latest_data["active_delivery_id"] = delivery_id
+        latest_data["monitoring_active"] = True
+
+    return jsonify({
+        "message": "Delivery started successfully",
+        "delivery_id": delivery_id
+    })
+
+
+@app.route("/stop-delivery", methods=["POST"])
+def stop_delivery():
+    data = request.get_json()
+
+    if not data or "delivery_id" not in data:
+        return jsonify({"error": "Missing delivery_id"}), 400
+
+    delivery_id = data["delivery_id"]
+
+    conn = get_db_connection()
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT *
+        FROM deliveries
+        WHERE id = ?
+    """, (delivery_id,))
+
+    delivery = cur.fetchone()
+
+    if delivery is None:
+        conn.close()
+        return jsonify({"error": "Delivery not found"}), 404
+
+    if delivery["status"] != "in_progress":
+        conn.close()
+        return jsonify({"error": "Only in-progress deliveries can be completed"}), 400
+
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    cur.execute("""
+        UPDATE deliveries
+        SET status = 'completed',
+            end_time = ?
+        WHERE id = ?
+    """, (now, delivery_id))
+
+    if delivery["request_id"] is not None:
+        cur.execute("""
+            UPDATE delivery_requests
+            SET status = 'completed'
+            WHERE id = ?
+        """, (delivery["request_id"],))
+
+    conn.commit()
+    conn.close()
+
+    with data_lock:
+        if latest_data["active_delivery_id"] == delivery_id:
+            latest_data["active_delivery_id"] = None
+
+    return jsonify({
+        "message": "Delivery completed successfully",
+        "delivery_id": delivery_id
+    })
 
 @app.route("/history-v2")
 def history_v2():
@@ -489,107 +667,10 @@ def history_v2():
 
     return jsonify(result)
 
-@app.route("/driver-deliveries/<int:driver_id>")
-def get_driver_deliveries(driver_id):
-    conn = get_db_connection()
-    cur = conn.cursor()
-
-    cur.execute("""
-        SELECT id, driver_id, school_id, food_type, quantity, status, start_time, end_time, notes, created_at
-        FROM deliveries
-        WHERE driver_id = ?
-        ORDER BY id DESC
-    """, (driver_id,))
-
-    rows = cur.fetchall()
-    conn.close()
-
-    result = []
-
-    for row in rows:
-        result.append({
-            "id": row["id"],
-            "driver_id": row["driver_id"],
-            "school_id": row["school_id"],
-            "food_type": row["food_type"],
-            "quantity": row["quantity"],
-            "status": row["status"],
-            "start_time": row["start_time"],
-            "end_time": row["end_time"],
-            "notes": row["notes"],
-            "created_at": row["created_at"]
-        })
-
-    return jsonify(result)
-
-@app.route("/start-delivery", methods=["POST"])
-def start_delivery_post():
-    data = request.get_json()
-
-    if not data or "delivery_id" not in data:
-        return jsonify({"error": "Missing delivery_id"}), 400
-
-    delivery_id = data["delivery_id"]
-
-    conn = get_db_connection()
-    cur = conn.cursor()
-
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-    cur.execute("""
-        UPDATE deliveries
-        SET status = 'active', start_time = ?
-        WHERE id = ?
-    """, (now, delivery_id))
-
-    conn.commit()
-    conn.close()
-
-    with data_lock:
-        latest_data["active_delivery_id"] = delivery_id
-
-    return jsonify({
-        "message": "Delivery started",
-        "delivery_id": delivery_id
-    })
-
-
-
-@app.route("/stop-delivery", methods=["POST"])
-def stop_delivery_post():
-    data = request.get_json()
-
-    if not data or "delivery_id" not in data:
-        return jsonify({"error": "Missing delivery_id"}), 400
-
-    delivery_id = data["delivery_id"]
-
-    conn = get_db_connection()
-    cur = conn.cursor()
-
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-    cur.execute("""
-        UPDATE deliveries
-        SET status = 'completed', end_time = ?
-        WHERE id = ?
-    """, (now, delivery_id))
-
-    conn.commit()
-    conn.close()
-
-    with data_lock:
-        if latest_data["active_delivery_id"] == delivery_id:
-            latest_data["active_delivery_id"] = None
-
-    return jsonify({
-        "message": "Delivery completed",
-        "delivery_id": delivery_id
-    })
-
-
 
 if __name__ == "__main__":
+    ensure_request_id_column()
+
     thread = threading.Thread(target=sensor_loop, daemon=True)
     thread.start()
 
