@@ -36,6 +36,17 @@ def create_tables():
     """)
 
     cur.execute("""
+    CREATE TABLE IF NOT EXISTS users (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        username TEXT UNIQUE NOT NULL,
+        password_hash TEXT NOT NULL,
+        role TEXT NOT NULL CHECK(role IN ('admin', 'driver', 'school')),
+        linked_entity_id INTEGER,
+        created_at TEXT NOT NULL
+    )
+    """)
+
+    cur.execute("""
     CREATE TABLE IF NOT EXISTS deliveries (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         driver_id INTEGER NOT NULL,
@@ -95,7 +106,6 @@ def create_tables():
         FOREIGN KEY (school_id) REFERENCES schools(id)
     )
     """)
-
     conn.commit()
     conn.close()
 
@@ -149,6 +159,7 @@ def show_table_counts():
     tables = [
         "drivers",
         "schools",
+        "users",
         "deliveries",
         "monitoring_records",
         "delivery_requests",
