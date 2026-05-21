@@ -13,6 +13,9 @@ import board
 import urllib.parse
 import urllib.request
 import math
+import os
+import joblib
+import pandas as pd
 
 app = Flask(__name__)
 
@@ -25,6 +28,11 @@ app.config["SESSION_COOKIE_SECURE"] = False
 CORS(app, supports_credentials=True)
 
 DB_FILE = "iot_data_v2.db"
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+ML_DIR = os.path.join(BASE_DIR, "ml")
+DRIVER_RISK_MODEL_PATH = os.path.join(ML_DIR, "driver_risk_model.pkl")
+DRIVER_RISK_FEATURES_PATH = os.path.join(ML_DIR, "driver_risk_features.pkl")
 
 TILT_GPIO = 17
 DHT_PIN = board.D4
@@ -1333,6 +1341,653 @@ def get_osrm_driving_distance(start_lat, start_lon, end_lat, end_lon):
     duration_minutes = round(route["duration"] / 60, 1)
 
     return distance_km, duration_minutes
+
+def load_driver_risk_model():
+    if not os.path.exists(DRIVER_RISK_MODEL_PATH):
+        raise FileNotFoundError("Driver risk model file was not found.")
+
+    if not os.path.exists(DRIVER_RISK_FEATURES_PATH):
+        raise FileNotFoundError("Driver risk feature file was not found.")
+
+    model = joblib.load(DRIVER_RISK_MODEL_PATH)
+    feature_columns = joblib.load(DRIVER_RISK_FEATURES_PATH)
+
+    return model, feature_columns
+
+
+def parse_food_names(food_text):
+    if not food_text:
+        return []
+
+    food_names = []
+
+    for item in food_text.split(","):
+        cleaned = item.strip()
+
+        if "(" in cleaned:
+            cleaned = cleaned.split("(")[0].strip()
+
+        if cleaned:
+            food_names.append(cleaned.lower())
+
+    return food_names
+
+
+def extract_total_quantity(food_text, fallback_quantity):
+    if not food_text:
+        return float(fallback_quantity or 0)
+
+    total = 0.0
+
+    for item in food_text.split(","):
+        if "(" not in item or ")" not in item:
+            continue
+
+        inside_parentheses = item.split("(")[1].split(")")[0]
+        parts = inside_parentheses.strip().split()
+
+        if not parts:
+            continue
+
+        try:
+            total += float(parts[0])
+        except Exception:
+            pass
+
+    if total <= 0:
+        return float(fallback_quantity or 0)
+
+    return total
+def extract_food_sensitivity_features(food_text):
+    food_names = parse_food_names(food_text)
+
+    if not food_names:
+        return {
+            "cold_sensitive": 0,
+            "tilt_sensitive": 0,
+            "liquid_sensitive": 0,
+            "dairy_sensitive": 0,
+            "meat_fish_sensitive": 0,
+            "stable_food_ratio": 0.0,
+        }
+
+    cold_keywords = [
+        "milk",
+        "yogurt",
+        "cheese",
+        "chicken",
+        "fish",
+        "tuna",
+        "beef",
+        "turkey",
+        "meat",
+        "eggs",
+    ]
+
+    tilt_keywords = [
+        "soup",
+        "eggs",
+        "pizza",
+        "milk",
+        "juice",
+        "water",
+        "cake",
+        "cakes",
+    ]
+
+    liquid_keywords = [
+        "soup",
+        "milk",
+        "juice",
+        "water",
+        "liters",
+    ]
+
+    dairy_keywords = [
+        "milk",
+        "yogurt",
+        "cheese",
+    ]
+
+    meat_fish_keywords = [
+        "chicken",
+        "fish",
+        "tuna",
+        "beef",
+        "turkey",
+        "meat",
+    ]
+
+    stable_keywords = [
+        "pasta",
+        "bread",
+        "rice",
+        "potatoes",
+        "beans",
+        "chickpeas",
+        "carrots",
+        "onions",
+        "tomatoes",
+        "pears",
+        "apples",
+    ]
+
+    def contains_any(food_name, keywords):
+        return any(keyword in food_name for keyword in keywords)
+
+    cold_sensitive = 1 if any(contains_any(food, cold_keywords) for food in food_names) else 0
+    tilt_sensitive = 1 if any(contains_any(food, tilt_keywords) for food in food_names) else 0
+    liquid_sensitive = 1 if any(contains_any(food, liquid_keywords) for food in food_names) else 0
+    dairy_sensitive = 1 if any(contains_any(food, dairy_keywords) for food in food_names) else 0
+    meat_fish_sensitive = 1 if any(contains_any(food, meat_fish_keywords) for food in food_names) else 0
+
+    stable_count = sum(
+        1 for food in food_names if contains_any(food, stable_keywords)
+    )
+
+    stable_food_ratio = round(stable_count / len(food_names), 2)
+
+    return {
+        "cold_sensitive": cold_sensitive,
+        "tilt_sensitive": tilt_sensitive,
+        "liquid_sensitive": liquid_sensitive,
+        "dairy_sensitive": dairy_sensitive,
+        "meat_fish_sensitive": meat_fish_sensitive,
+        "stable_food_ratio": stable_food_ratio,
+    }
+    
+    
+def parse_datetime_safe(value):
+    if not value:
+        return None
+
+    try:
+        return datetime.strptime(value, "%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return None
+
+
+def get_request_time_features(requested_delivery_time):
+    requested_dt = parse_datetime_safe(requested_delivery_time)
+
+    urgent_delivery = 0
+    lunch_peak_time = 0
+
+    if requested_dt:
+        now = datetime.now()
+        minutes_until_delivery = (requested_dt - now).total_seconds() / 60
+
+        if 0 <= minutes_until_delivery <= 120:
+            urgent_delivery = 1
+
+        if 11 <= requested_dt.hour <= 14:
+            lunch_peak_time = 1
+
+    return urgent_delivery, lunch_peak_time
+
+
+def get_driver_performance_profile(driver_id):
+    conn = get_db_connection()
+    cur = conn.cursor()
+
+    cur.execute(
+        """
+        SELECT id, start_time, end_time
+        FROM deliveries
+        WHERE driver_id = ?
+        AND status = 'completed'
+        ORDER BY id ASC
+    """,
+        (driver_id,),
+    )
+
+    deliveries = cur.fetchall()
+
+    completed_deliveries = len(deliveries)
+
+    if completed_deliveries == 0:
+        return {
+            "completed_deliveries": 0,
+            "avg_temp_risk_minutes": 4.0,
+            "avg_humidity_risk_minutes": 4.0,
+            "avg_tilt_risk_minutes": 3.0,
+            "avg_alerts": 5.0,
+            "avg_distance_km": 3.0,
+            "completion_reliability": 0.70,
+        }
+
+    total_temp_risk_minutes = 0.0
+    total_humidity_risk_minutes = 0.0
+    total_tilt_risk_minutes = 0.0
+    total_alerts = 0
+    total_distance_km = 0.0
+    deliveries_with_distance = 0
+
+    for delivery in deliveries:
+        delivery_id = delivery["id"]
+        end_dt = parse_datetime_safe(delivery["end_time"])
+
+        cur.execute(
+            """
+            SELECT *
+            FROM monitoring_records
+            WHERE delivery_id = ?
+            ORDER BY timestamp ASC
+        """,
+            (delivery_id,),
+        )
+
+        records = cur.fetchall()
+
+        if not records:
+            continue
+
+        first_lat = records[0]["latitude"]
+        first_lon = records[0]["longitude"]
+        last_lat = records[-1]["latitude"]
+        last_lon = records[-1]["longitude"]
+
+        if (
+            first_lat is not None
+            and first_lon is not None
+            and last_lat is not None
+            and last_lon is not None
+        ):
+            try:
+                distance = calculate_haversine_km(
+                    first_lat,
+                    first_lon,
+                    last_lat,
+                    last_lon
+                )
+                total_distance_km += distance
+                deliveries_with_distance += 1
+            except Exception:
+                pass
+        for index, record in enumerate(records):
+            current_time = parse_datetime_safe(record["timestamp"])
+
+            if current_time is None:
+                continue
+
+            if index + 1 < len(records):
+                next_time = parse_datetime_safe(records[index + 1]["timestamp"])
+            else:
+                next_time = end_dt
+
+            if next_time is None:
+                interval_seconds = 60
+            else:
+                interval_seconds = (next_time - current_time).total_seconds()
+
+            if interval_seconds <= 0:
+                interval_seconds = 60
+
+            interval_minutes = interval_seconds / 60
+
+            if interval_minutes > 5:
+                interval_minutes = 5
+
+            temperature = record["temperature"]
+            humidity = record["humidity"]
+            tilt = bool(record["tilt"])
+
+            if temperature is not None and temperature > 26:
+                total_temp_risk_minutes += interval_minutes
+
+            if humidity is not None and humidity > 60:
+                total_humidity_risk_minutes += interval_minutes
+
+            if tilt:
+                total_tilt_risk_minutes += interval_minutes
+
+            alerts_raw = record["alerts"]
+
+            if alerts_raw:
+                try:
+                    alerts = json.loads(alerts_raw)
+                except Exception:
+                    alerts = [alerts_raw]
+
+                total_alerts += len(alerts)
+
+
+        avg_temp_risk_minutes = round(total_temp_risk_minutes / completed_deliveries, 2)
+        avg_humidity_risk_minutes = round(total_humidity_risk_minutes / completed_deliveries, 2)
+        avg_tilt_risk_minutes = round(total_tilt_risk_minutes / completed_deliveries, 2)
+        avg_alerts = round(total_alerts / completed_deliveries, 2)
+
+    if deliveries_with_distance > 0:
+        avg_distance_km = round(total_distance_km / deliveries_with_distance, 2)
+    else:
+        avg_distance_km = 3.0
+
+    risk_pressure = (
+        avg_temp_risk_minutes
+        + avg_humidity_risk_minutes
+        + avg_tilt_risk_minutes
+        + avg_alerts
+    )
+
+    completion_reliability = max(0.40, min(0.99, 1.0 - (risk_pressure / 40)))
+    completion_reliability = round(completion_reliability, 2)
+
+    conn.close()
+
+    return {
+        "completed_deliveries": completed_deliveries,
+        "avg_temp_risk_minutes": avg_temp_risk_minutes,
+        "avg_humidity_risk_minutes": avg_humidity_risk_minutes,
+        "avg_tilt_risk_minutes": avg_tilt_risk_minutes,
+        "avg_alerts": avg_alerts,
+        "avg_distance_km": avg_distance_km,
+        "completion_reliability": completion_reliability,
+    }
+    
+    
+def risk_to_score(risk_level, probabilities=None, driver_profile=None, request_features=None):
+    base_scores = {
+        "low": 90,
+        "medium": 65,
+        "high": 35,
+    }
+
+    score = base_scores.get(risk_level, 50)
+
+    if probabilities:
+        low_probability = probabilities.get("low", 0)
+        high_probability = probabilities.get("high", 0)
+
+        score += int(low_probability * 10)
+        score -= int(high_probability * 10)
+
+    if driver_profile:
+        avg_alerts = driver_profile.get("avg_alerts", 0)
+        avg_temp_risk = driver_profile.get("avg_temp_risk_minutes", 0)
+        avg_humidity_risk = driver_profile.get("avg_humidity_risk_minutes", 0)
+        avg_tilt_risk = driver_profile.get("avg_tilt_risk_minutes", 0)
+        reliability = driver_profile.get("completion_reliability", 0.7)
+        completed_deliveries = driver_profile.get("completed_deliveries", 0)
+
+        score -= min(25, avg_alerts * 2)
+        score -= min(20, avg_temp_risk * 3)
+        score -= min(20, avg_humidity_risk * 3)
+        score -= min(25, avg_tilt_risk * 4)
+
+        if reliability < 0.9:
+            score -= int((0.9 - reliability) * 40)
+
+        if completed_deliveries >= 5:
+            score += 5
+        elif completed_deliveries == 0:
+            score -= 10
+
+    if request_features and driver_profile:
+        if request_features.get("tilt_sensitive") == 1:
+            score -= min(20, driver_profile.get("avg_tilt_risk_minutes", 0) * 3)
+
+        if request_features.get("cold_sensitive") == 1:
+            temperature_pressure = (
+                driver_profile.get("avg_temp_risk_minutes", 0)
+                + driver_profile.get("avg_humidity_risk_minutes", 0)
+            )
+            score -= min(20, temperature_pressure * 2)
+
+        if request_features.get("liquid_sensitive") == 1:
+            score -= min(15, driver_profile.get("avg_tilt_risk_minutes", 0) * 2)
+
+    return max(0, min(100, int(score)))
+
+
+def build_recommendation_reasons(driver_profile, request_features, predicted_risk):
+    reasons = []
+
+    if predicted_risk == "low":
+        reasons.append("The model predicts a low delivery-condition risk for this driver.")
+    elif predicted_risk == "medium":
+        reasons.append("The model predicts a medium delivery-condition risk for this driver.")
+    else:
+        reasons.append("The model predicts a high delivery-condition risk for this driver.")
+
+    if driver_profile["completed_deliveries"] > 0:
+        reasons.append(
+            f"Driver has {driver_profile['completed_deliveries']} completed deliveries in the system."
+        )
+    else:
+        reasons.append("Driver has no completed delivery history yet, so default profile values were used.")
+
+    if driver_profile["avg_temp_risk_minutes"] <= 2:
+        reasons.append("Previous deliveries show low ambient temperature anomaly time.")
+    elif driver_profile["avg_temp_risk_minutes"] >= 5:
+        reasons.append("Previous deliveries show significant ambient temperature anomaly time.")
+
+    if driver_profile["avg_humidity_risk_minutes"] <= 2:
+        reasons.append("Previous deliveries show low humidity anomaly time.")
+    elif driver_profile["avg_humidity_risk_minutes"] >= 5:
+        reasons.append("Previous deliveries show significant humidity anomaly time.")
+
+    if driver_profile["avg_tilt_risk_minutes"] <= 1.5:
+        reasons.append("Previous deliveries show low tilt instability.")
+    elif driver_profile["avg_tilt_risk_minutes"] >= 4:
+        reasons.append("Previous deliveries show high tilt instability.")
+
+    if request_features["cold_sensitive"] == 1:
+        reasons.append("The order contains cold-sensitive food categories.")
+
+    if request_features["tilt_sensitive"] == 1:
+        reasons.append("The order contains tilt-sensitive or fragile food categories.")
+
+    if request_features["long_distance"] == 1:
+        reasons.append("The estimated delivery distance is relatively long.")
+
+    return reasons[:5]
+    
+    
+@app.route("/recommend-driver", methods=["POST"])
+@login_required
+@role_required("admin")
+def recommend_driver():
+    data = request.get_json()
+
+    if not data:
+        return jsonify({"error": "No JSON body provided"}), 400
+
+    request_id = data.get("request_id")
+
+    if not request_id:
+        return jsonify({"error": "request_id is required"}), 400
+
+    try:
+        model, feature_columns = load_driver_risk_model()
+    except Exception as error:
+        return jsonify({"error": f"ML model could not be loaded: {str(error)}"}), 500
+
+    conn = get_db_connection()
+    cur = conn.cursor()
+
+    cur.execute(
+        """
+        SELECT
+            dr.id,
+            dr.school_id,
+            dr.food_type,
+            dr.quantity,
+            dr.requested_delivery_time,
+            s.latitude AS school_latitude,
+            s.longitude AS school_longitude,
+            s.name AS school_name
+        FROM delivery_requests dr
+        LEFT JOIN schools s
+            ON s.id = dr.school_id
+        WHERE dr.id = ?
+    """,
+        (request_id,),
+    )
+
+    delivery_request = cur.fetchone()
+
+    if delivery_request is None:
+        conn.close()
+        return jsonify({"error": "Delivery request not found"}), 404
+
+    cur.execute(
+        """
+        SELECT
+            d.id,
+            d.full_name,
+            d.status
+        FROM drivers d
+        ORDER BY d.full_name ASC
+    """
+    )
+
+    drivers = cur.fetchall()
+    conn.close()
+
+    if not drivers:
+        return jsonify({"error": "No drivers available"}), 404
+
+    food_features = extract_food_sensitivity_features(delivery_request["food_type"])
+
+    request_quantity = extract_total_quantity(
+        delivery_request["food_type"],
+        delivery_request["quantity"]
+    )
+
+    urgent_delivery, lunch_peak_time = get_request_time_features(
+        delivery_request["requested_delivery_time"]
+    )
+
+    distance_km = 3.0
+
+    with data_lock:
+        current_lat = latest_data["lat"]
+        current_lon = latest_data["lon"]
+
+    school_latitude = delivery_request["school_latitude"]
+    school_longitude = delivery_request["school_longitude"]
+
+    if (
+        current_lat is not None
+        and current_lon is not None
+        and school_latitude is not None
+        and school_longitude is not None
+    ):
+        try:
+            distance_km = round(
+                calculate_haversine_km(
+                    current_lat,
+                    current_lon,
+                    school_latitude,
+                    school_longitude
+                ),
+                2,
+            )
+        except Exception:
+            distance_km = 3.0
+            
+        high_quantity = 1 if request_quantity >= 70 else 0
+    long_distance = 1 if distance_km >= 5 else 0
+
+    high_quantity = 1 if request_quantity >= 70 else 0
+    long_distance = 1 if distance_km >= 5 else 0
+
+    request_features = {
+        "request_quantity": request_quantity,
+        "distance_km": distance_km,
+        "cold_sensitive": food_features["cold_sensitive"],
+        "tilt_sensitive": food_features["tilt_sensitive"],
+        "liquid_sensitive": food_features["liquid_sensitive"],
+        "dairy_sensitive": food_features["dairy_sensitive"],
+        "meat_fish_sensitive": food_features["meat_fish_sensitive"],
+        "stable_food_ratio": food_features["stable_food_ratio"],
+        "high_quantity": high_quantity,
+        "long_distance": long_distance,
+        "urgent_delivery": urgent_delivery,
+        "lunch_peak_time": lunch_peak_time,
+    }
+
+    ranked_drivers = []
+
+    for driver in drivers:
+        driver_profile = get_driver_performance_profile(driver["id"])
+
+        feature_row = {
+            **driver_profile,
+            **request_features,
+        }
+
+        ordered_row = {
+            column: feature_row.get(column, 0)
+            for column in feature_columns
+        }
+
+        prediction_input = pd.DataFrame([ordered_row], columns=feature_columns)
+
+        predicted_risk = model.predict(prediction_input)[0]
+
+        probabilities = {}
+
+        if hasattr(model, "predict_proba"):
+            probability_values = model.predict_proba(prediction_input)[0]
+
+            for index, class_name in enumerate(model.classes_):
+                probabilities[class_name] = round(float(probability_values[index]), 3)
+
+                score = risk_to_score(
+                    predicted_risk,
+                    probabilities,
+                    driver_profile,
+                    request_features
+                )
+
+        ranked_drivers.append(
+            {
+                "driver_id": driver["id"],
+                "driver_name": driver["full_name"],
+                "driver_status": driver["status"],
+                "predicted_risk": predicted_risk,
+                "score": score,
+                "probabilities": probabilities,
+                "profile": driver_profile,
+                "reasons": build_recommendation_reasons(
+                    driver_profile,
+                    request_features,
+                    predicted_risk
+                ),
+            }
+        )
+
+    risk_rank = {
+        "low": 0,
+        "medium": 1,
+        "high": 2,
+    }
+    ranked_drivers.sort(
+    key=lambda item: (
+        risk_rank.get(item["predicted_risk"], 9),
+        -item["score"],
+    )
+)
+
+    recommended_driver = ranked_drivers[0]
+
+    return jsonify(
+        {
+            "request_id": delivery_request["id"],
+            "school_id": delivery_request["school_id"],
+            "school_name": delivery_request["school_name"],
+            "food_type": delivery_request["food_type"],
+            "request_features": request_features,
+            "recommended_driver_id": recommended_driver["driver_id"],
+            "recommended_driver_name": recommended_driver["driver_name"],
+            "predicted_risk": recommended_driver["predicted_risk"],
+            "score": recommended_driver["score"],
+            "reasons": recommended_driver["reasons"],
+            "drivers": ranked_drivers,
+        }
+    )
+
 
 @app.route("/delivery-report/<int:delivery_id>")
 @login_required

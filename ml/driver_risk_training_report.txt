@@ -1,0 +1,32 @@
+Driver Risk Model Training Report
+=================================
+
+Dataset rows: 65
+Training rows: 48
+Testing rows: 17
+Accuracy: 0.94
+
+Classification report:
+              precision    recall  f1-score   support
+
+        high       0.86      1.00      0.92         6
+         low       1.00      1.00      1.00         5
+      medium       1.00      0.83      0.91         6
+
+    accuracy                           0.94        17
+   macro avg       0.95      0.94      0.94        17
+weighted avg       0.95      0.94      0.94        17
+
+Confusion matrix labels: low, medium, high
+[[5 0 0]
+ [0 5 1]
+ [0 0 6]]
+
+Learned decision tree rules:
+|--- avg_temp_risk_minutes <= 4.75
+|   |--- avg_humidity_risk_minutes <= 1.55
+|   |   |--- class: low
+|   |--- avg_humidity_risk_minutes >  1.55
+|   |   |--- class: medium
+|--- avg_temp_risk_minutes >  4.75
+|   |--- class: high
